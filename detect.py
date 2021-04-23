@@ -9,6 +9,8 @@ import cv2
 import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
+import numpy as np
+from scipy.signal import savgol_filter
 
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
@@ -102,6 +104,10 @@ def detect(save_img=False):
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
 
     _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
+
+    crds_crop = np.empty((0, 4))
+
+    # dataset contains all the frames (or images) of the video
     for path, img, im0s, vid_cap in dataset:  # im0s, img - initial img, im0s padded to imgsz
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -139,7 +145,23 @@ def detect(save_img=False):
                 xywhs = xyxy2xywh(det[:, :4].cpu())
                 confs = det[:,4].cpu()
                 # Pass detections to deepsort
-                outputs = deepsort.update(xywhs, confs, im0)
+                outputs = deepsort.update(xywhs, confs, im0)  # this is numpy array
+                ###########################################################
+                # FOR NOW, WE WILL ONLY BE KEEPING THE MOST CONFIDENT VALUE
+                ###########################################################
+                max_conf_id = confs.argmax()
+                # keeping the coordinates row with max conf (det now only keeps one row and four columns)
+                det = det[max_conf_id, :].reshape(-1, 6)
+                to_append = det[:,:4].cpu().numpy().reshape(-1,4).astype(int)
+                if len(crds_crop) == 0:
+                    crds_crop = np.append(crds_crop, to_append).reshape(-1, 4)
+                else:
+                    crds_crop = np.append(crds_crop, to_append, axis=0)
+                # draw boxes for visualization
+                if len(outputs) > 0:
+                    bbox_xyxy = outputs[:, :4]
+                    identities = outputs[:, -1]
+                    # draw_boxes(im0, bbox_xyxy, identities)  # no tracking boxes for now
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
@@ -147,24 +169,13 @@ def detect(save_img=False):
 
                 # Write results
                 for *xyxy, conf, cls in det:
-
                     if save_txt:  # Write to file
-                        # xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * 5 + '\n') % (*xyxy, conf))  # label format
 
                     if save_img or view_img:  # Add bbox to image
                         label = '%s' % (names[int(cls)])
                         plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=2)
-
-                # draw boxes for visualization
-                if len(outputs) > 0:
-                    bbox_xyxy = outputs[:, :4]
-                    identities = outputs[:, -1]
-                    draw_boxes(im0, bbox_xyxy, identities)
-
-
-                print(outputs, det[:,:5], 'look here!!!')
 
             else:
                 deepsort.increment_ages()
@@ -193,6 +204,8 @@ def detect(save_img=False):
                         h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h))
                     vid_writer.write(im0)
+
+
 
     if save_txt or save_img:
         print('Results saved to %s' % Path(out))
