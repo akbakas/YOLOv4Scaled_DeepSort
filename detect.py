@@ -3,13 +3,14 @@ import os
 import platform
 import shutil
 import time
+import copy
 from pathlib import Path
 
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
-from numpy import random
 import numpy as np
+from pandas import DataFrame
 from scipy.signal import savgol_filter
 
 from models.experimental import attempt_load
@@ -22,6 +23,27 @@ from deep_sort_pytorch.deep_sort import DeepSort
 
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 
+
+def linear_interp(x: 'np.array') -> 'np.array':
+    x = DataFrame(x).interpolate(method='linear',
+                                 axis=0,
+                                 limit_direction='both').to_numpy()
+    return x
+
+
+def smoothing(arr: 'np.array([x,y,w,h,m])', fps):
+    # (w,h) do not get smoothed here!
+    # get odd fps
+    odd = lambda x: x if x % 2 != 0 else x + 1
+    x = copy.deepcopy(arr)
+    x[:, :2] = savgol_filter(x[:, :2], odd(int(fps*2)), 3, mode='nearest', axis=0)
+    x[:, :2] = savgol_filter(x[:, :2], odd(int(fps)), 3, axis=0)
+    x[:, :2] = savgol_filter(x[:, :2], odd(int(fps/1.5)), 2, axis=0)
+    x[:, -1] = savgol_filter(x[:, -1], odd(int(fps*2)), 3, axis=0)
+    x[:, -1] = savgol_filter(x[:, -1], odd(int(fps)), 2, axis=0)
+    x[:, -1] = savgol_filter(x[:, -1], odd(int(fps/2)), 1, axis=0)
+    x[:, -1] = savgol_filter(x[:, -1], odd(int(fps/4)), 1, axis=0)
+    return x.astype(int)
 
 def compute_color_for_labels(label):
     """
@@ -69,6 +91,9 @@ def detect(save_img=False):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     if os.path.exists(out):
         shutil.rmtree(out)  # delete output folder
+    if not os.path.exists(opt.smooth_txt):
+        os.makedirs(opt.smooth_txt)
+
     os.makedirs(out)  # make new output folder
     half = device.type != 'cpu'  # half precision only supported on CUDA
 
@@ -97,18 +122,19 @@ def detect(save_img=False):
 
     # Get names and colors
     names = model.module.names if hasattr(model, 'module') else model.names
-    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
+    colors = [[np.random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
     # Run inference
     t0 = time.time()
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
 
     _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-
-    crds_crop = np.empty((0, 4))
-
     # dataset contains all the frames (or images) of the video
-    for path, img, im0s, vid_cap in dataset:  # im0s, img - initial img, im0s padded to imgsz
+    crds_crop = np.empty((0, 4))  # contains coordinates of a single bbox with the highest conf
+    np_nan = np.empty([1, 4])  # for tracking
+    np_nan[:] = np.nan  # for tracking
+    frame_no = 0
+    for path, img, im0s, vid_cap in dataset:  # im0s, img - initial, resized and padded (img)
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -151,8 +177,8 @@ def detect(save_img=False):
                 ###########################################################
                 max_conf_id = confs.argmax()
                 # keeping the coordinates row with max conf (det now only keeps one row and four columns)
-                det = det[max_conf_id, :].reshape(-1, 6)
-                to_append = det[:,:4].cpu().numpy().reshape(-1,4).astype(int)
+                det = det[max_conf_id, :].reshape(1, 6)
+                to_append = xyxy2xywh(det[:, :4].cpu().numpy().reshape(1, 4).astype(int))
                 if len(crds_crop) == 0:
                     crds_crop = np.append(crds_crop, to_append).reshape(-1, 4)
                 else:
@@ -179,6 +205,10 @@ def detect(save_img=False):
 
             else:
                 deepsort.increment_ages()
+                if len(crds_crop) == 0:
+                    crds_crop = np.append(crds_crop, np_nan).reshape(-1, 4)
+                else:
+                    crds_crop = np.append(crds_crop, np_nan, axis=0)
             # Print time (inference + NMS)
             print('%sDone. (%.3fs)' % (s, t2 - t1))
 
@@ -192,6 +222,7 @@ def detect(save_img=False):
             if save_img:
                 if dataset.mode == 'images':
                     cv2.imwrite(save_path, im0)
+
                 else:
                     if vid_path != save_path:  # new video
                         vid_path = save_path
@@ -204,9 +235,17 @@ def detect(save_img=False):
                         h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h))
                     vid_writer.write(im0)
-
-
-
+        frame_no += 1
+    ##############################################################################
+    # this part should be temporary as online filtering will be implemented
+    crds_crop = linear_interp(crds_crop)
+    max_side_bbox = crds_crop[:, 2:].max(axis=1) * 1.2  # 20% relaxation
+    # making sure that the window size does not exceed frame size
+    max_side_bbox = np.where(max_side_bbox < min(w,h), max_side_bbox, min(w,h))
+    crds_crop = np.c_[crds_crop, max_side_bbox]
+    crds_crop = smoothing(crds_crop, fps)
+    np.savetxt(os.path.join(opt.smooth_txt, os.path.basename(path)[:-4] + '_savgol_' + '.txt'),
+               crds_crop, delimiter=' ')
     if save_txt or save_img:
         print('Results saved to %s' % Path(out))
         if platform == 'darwin' and not opt.update:  # MacOS
@@ -231,6 +270,7 @@ if __name__ == '__main__':
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--update', action='store_true', help='update all models')
     parser.add_argument('--config_deepsort', type=str, default='deep_sort_pytorch/configs/deep_sort.yaml')
+    parser.add_argument('--smooth-txt', type=str, default='inference/coordinates', help='coordinates output folder')
     opt = parser.parse_args()
 
     with torch.no_grad():
